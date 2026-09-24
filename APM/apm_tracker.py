@@ -12,11 +12,15 @@ import argparse
 import csv
 import ctypes
 import ctypes.util
+import json
+import shutil
 import signal
+import subprocess
 import sys
 import threading
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, TextIO
@@ -32,6 +36,15 @@ SCHEDULER_WAIT_INTERVAL_SECONDS = SECONDS_PER_MINUTE
 CSV_HEADER = ("actions", "timestamp")
 APP_FOCUS_HEADER = (
     "app_name",
+    "started_at",
+    "stopped_at",
+    "duration_seconds",
+)
+MEDIA_HEADER = (
+    "source",
+    "title",
+    "artist",
+    "album",
     "started_at",
     "stopped_at",
     "duration_seconds",
@@ -330,7 +343,7 @@ class AppFocusTracker:
                 return
             if self._current_app == app_name:
                 return
-            if self._current_app is not None and self._started_at is not None:
+            if self._started_at is not None:
                 self.recorder.record(self._current_app, self._started_at, observed_at)
             self._current_app = app_name
             self._started_at = observed_at
@@ -344,6 +357,259 @@ class AppFocusTracker:
                     stopped_at,
                 )
                 self._current_app = None
+                self._started_at = None
+
+
+@dataclass(frozen=True)
+class PlayingMedia:
+    """The identifying metadata for one item reported by macOS Now Playing."""
+
+    source: str
+    title: str
+    artist: str = ""
+    album: str = ""
+
+
+class MediaCsvRecorder:
+    """Append completed Now Playing sessions to a dedicated CSV file."""
+
+    def __init__(self, path: Path, stream: TextIO | None = None) -> None:
+        self.path = path
+        self._stream = stream
+        self._owns_stream = stream is None
+
+        if self._stream is None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._stream = self.path.open("a", newline="", encoding="utf-8")
+
+        self._writer = csv.writer(self._stream)
+        assert self._stream is not None
+        if self._stream.tell() == 0:
+            self._writer.writerow(MEDIA_HEADER)
+            self._stream.flush()
+
+    def record(
+        self,
+        media: PlayingMedia,
+        started_at: float,
+        stopped_at: float,
+    ) -> None:
+        """Write one playback session and flush it so current data is durable."""
+
+        assert self._stream is not None
+        self._writer.writerow(
+            (
+                media.source,
+                media.title,
+                media.artist,
+                media.album,
+                format_timestamp(started_at),
+                format_timestamp(stopped_at),
+                f"{max(0.0, stopped_at - started_at):.3f}",
+            )
+        )
+        self._stream.flush()
+
+    def close(self) -> None:
+        """Close the destination when this recorder opened it."""
+
+        if self._owns_stream and self._stream is not None:
+            self._stream.close()
+
+    def __enter__(self) -> "MediaCsvRecorder":
+        return self
+
+    def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
+        self.close()
+
+
+class SystemNowPlayingProvider:
+    """Read metadata exposed by the macOS system media controller.
+
+    ``media-control`` uses Apple's MediaRemote service and supports newer
+    macOS versions where direct calls to that private framework are blocked
+    for ordinary processes. It is an optional external command, found on PATH.
+    """
+
+    SOURCE_NAMES = {
+        "com.apple.Music": "Music",
+        "com.apple.Safari": "Safari",
+        "com.google.Chrome": "Google Chrome",
+        "com.microsoft.edgemac": "Microsoft Edge",
+        "com.spotify.client": "Spotify",
+        "org.mozilla.firefox": "Firefox",
+        "com.brave.Browser": "Brave",
+    }
+
+    def __init__(self, command: str = "media-control") -> None:
+        resolved_command = shutil.which(command)
+        if resolved_command is None and Path(command).is_file():
+            resolved_command = str(Path(command))
+        if resolved_command is None:
+            raise RuntimeError(
+                f"could not find {command!r}; install media-control to enable "
+                "the system media tracker"
+            )
+        self.command = resolved_command
+
+    @classmethod
+    def _source_name(cls, info: dict[str, object]) -> str:
+        """Prefer a service label, then map the reporting app's bundle ID."""
+
+        for key in ("source", "serviceIdentifier", "applicationName", "displayName"):
+            value = info.get(key)
+            if isinstance(value, str) and value.strip():
+                value = value.strip()
+                if value in cls.SOURCE_NAMES:
+                    return cls.SOURCE_NAMES[value]
+                return value
+        for key in ("bundleIdentifier", "parentApplicationBundleIdentifier"):
+            value = info.get(key)
+            if isinstance(value, str) and value.strip():
+                if value in cls.SOURCE_NAMES:
+                    return cls.SOURCE_NAMES[value]
+                # Browser and player bundle IDs still make useful source
+                # labels when macOS does not provide a display name.
+                return value.rsplit(".", 1)[-1]
+        return "Unknown"
+
+    def __call__(self) -> PlayingMedia | None:
+        """Return current playing metadata, or ``None`` when nothing is playing."""
+
+        try:
+            result = subprocess.run(
+                [self.command, "get", "--no-artwork"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            # Player metadata can be briefly unavailable while apps start or
+            # switch. Keep the tracker alive and retry on its next poll.
+            return None
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        try:
+            info = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(info, dict):
+            return None
+
+        title = info.get("title")
+        if not isinstance(title, str) or not title.strip():
+            return None
+        playing = info.get("playing")
+        if playing is not True:
+            # Some releases expose playbackRate instead of the boolean state.
+            rate = info.get("playbackRate")
+            if not isinstance(rate, (int, float)) or rate <= 0:
+                return None
+        artist = info.get("artist")
+        album = info.get("album")
+        return PlayingMedia(
+            source=self._source_name(info),
+            title=title.strip(),
+            artist=artist.strip() if isinstance(artist, str) else "",
+            album=album.strip() if isinstance(album, str) else "",
+        )
+
+
+class MediaTracker:
+    """Record media sessions as the system Now Playing item changes."""
+
+    def __init__(
+        self,
+        recorder: MediaCsvRecorder,
+        provider: Callable[[], PlayingMedia | None],
+        clock=time.time,
+        poll_interval: float = 1.0,
+    ) -> None:
+        self.recorder = recorder
+        self._provider = provider
+        self._clock = clock
+        self._poll_interval = poll_interval
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._current_media: PlayingMedia | None = None
+        self._started_at: float | None = None
+
+    def start(self) -> None:
+        """Capture the current item and start one-second media polling."""
+
+        self.observe(self._provider(), self._clock())
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="system-now-playing",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop polling and close the active playback session."""
+
+        self._stop_event.set()
+        if self._thread is not None and self._thread is not threading.current_thread():
+            self._thread.join(timeout=5)
+        self._finish_current_session(self._clock())
+
+    def pause(self, stopped_at: float | None = None) -> None:
+        """End a media session before the computer goes to sleep."""
+
+        self._finish_current_session(
+            self._clock() if stopped_at is None else stopped_at
+        )
+
+    def resume(self, started_at: float | None = None) -> None:
+        """Start a fresh session from the media controller after waking."""
+
+        self.observe(
+            self._provider(),
+            self._clock() if started_at is None else started_at,
+        )
+
+    def _run(self) -> None:
+        """Sample system playback once a second; rows are emitted on changes."""
+
+        while not self._stop_event.wait(self._poll_interval):
+            try:
+                self.observe(self._provider(), self._clock())
+            except (OSError, subprocess.SubprocessError):
+                # A transient helper failure should not terminate the tracker.
+                continue
+
+    def observe(
+        self,
+        media: PlayingMedia | None,
+        observed_at: float | None = None,
+    ) -> None:
+        """Close the old session and start a new one when playback changes."""
+
+        observed_at = self._clock() if observed_at is None else observed_at
+        with self._lock:
+            if media == self._current_media:
+                return
+            if self._current_media is not None and self._started_at is not None:
+                self.recorder.record(
+                    self._current_media,
+                    self._started_at,
+                    observed_at,
+                )
+            self._current_media = media
+            self._started_at = observed_at if media is not None else None
+
+    def _finish_current_session(self, stopped_at: float) -> None:
+        with self._lock:
+            if self._current_media is not None and self._started_at is not None:
+                self.recorder.record(
+                    self._current_media,
+                    self._started_at,
+                    stopped_at,
+                )
+                self._current_media = None
                 self._started_at = None
 
 
@@ -836,7 +1102,7 @@ def consume_actions(input_stream: TextIO, counter: ActionCounter) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Count user actions and write minute CSV rows."
+        description="Track user actions, application focus, and system media."
     )
     parser.add_argument(
         "-o",
@@ -850,6 +1116,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("app_focus.csv"),
         help="application-focus CSV destination (default: app_focus.csv)",
+    )
+    parser.add_argument(
+        "--media-output",
+        type=Path,
+        default=Path("now_playing.csv"),
+        help="system Now Playing CSV destination (default: now_playing.csv)",
+    )
+    parser.add_argument(
+        "--media-command",
+        default="media-control",
+        help="media-control executable used to read system Now Playing metadata",
     )
     parser.add_argument(
         "--source",
@@ -887,10 +1164,15 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
 
-    with CsvRecorder(args.output) as recorder, AppFocusRecorder(args.app_output) as focus_recorder:
+    with (
+        CsvRecorder(args.output) as recorder,
+        AppFocusRecorder(args.app_output) as focus_recorder,
+        MediaCsvRecorder(args.media_output) as media_recorder,
+    ):
         source_name = selected_source(args.source)
         event_source: MacOSEventSource | None = None
         focus_tracker: AppFocusTracker | None = None
+        media_tracker: MediaTracker | None = None
         if source_name == "macos":
             counter = ActionCounter()
             tracker = MinuteTracker(
@@ -911,19 +1193,35 @@ def main(argv: list[str] | None = None) -> int:
         if sys.platform == "darwin":
             focus_tracker = AppFocusTracker(focus_recorder)
             focus_tracker.start()
+            try:
+                media_provider = SystemNowPlayingProvider(args.media_command)
+            except RuntimeError as exc:
+                print(f"System media tracking is unavailable: {exc}.", file=sys.stderr)
+            else:
+                media_tracker = MediaTracker(media_recorder, media_provider)
+                media_tracker.start()
+
+        def pause_sessions(at: float) -> None:
+            """End both time-based sessions as the machine enters sleep."""
+
+            if focus_tracker is not None:
+                focus_tracker.pause(at)
+            if media_tracker is not None:
+                media_tracker.pause(at)
 
         if source_name == "macos":
             event_source = MacOSEventSource(
                 counter,
                 scheduler_event,
-                on_sleep=focus_tracker.pause if focus_tracker is not None else None,
+                on_sleep=pause_sessions,
                 on_wake=focus_tracker.resume if focus_tracker is not None else None,
             )
             event_source.start()
 
         print(
             f"Recording actions from {source_name} to {args.output}; "
-            f"app focus to {args.app_output}. Press Ctrl-C to stop.",
+            f"app focus to {args.app_output}; system media to {args.media_output}. "
+            "Press Ctrl-C to stop.",
             file=sys.stderr,
         )
         try:
@@ -933,6 +1231,8 @@ def main(argv: list[str] | None = None) -> int:
                 event_source.stop()
             if focus_tracker is not None:
                 focus_tracker.stop()
+            if media_tracker is not None:
+                media_tracker.stop()
 
     return 0
 

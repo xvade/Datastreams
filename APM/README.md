@@ -1,9 +1,9 @@
 # Actions per minute tracker
 
 This project records actions in a two-column CSV file, one row per completed
-minute. The default output file is `apm.csv`, and macOS runs also produce an
-`app_focus.csv` file containing frontmost-application sessions. On macOS, an
-interactive run captures global keyboard and mouse actions directly; it no
+minute. macOS runs also track frontmost-application sessions in
+`app_focus.csv` and system Now Playing sessions in `now_playing.csv`. On macOS,
+an interactive run captures global keyboard and mouse actions directly; it no
 longer depends on the terminal producing one input line per action.
 
 ## Input contract
@@ -32,7 +32,8 @@ python3 apm_tracker.py --output apm.csv
 
 Use `--source macos` to require the macOS event tap, or `--source stdin` to
 require line-oriented input regardless of whether stdin is interactive. Use
-`--app-output PATH` to change the focus CSV destination.
+`--app-output PATH` and `--media-output PATH` to change the focus and media CSV
+destinations.
 
 The CSV contains a header followed by rows in this form:
 
@@ -75,10 +76,40 @@ wake, so sleeping time is excluded from `duration_seconds`. The macOS
 `loginwindow` process, which can appear frontmost while the laptop is asleep,
 is never written as an application session.
 
+## System media
+
+On macOS, the tracker polls the system Now Playing controller once per second
+and writes a row when playback starts, pauses, changes items or sources, or the
+tracker stops. The CSV includes the source reported by the system, title,
+artist, album, local ISO-8601 start and stop times, and session duration:
+
+```csv
+source,title,artist,album,started_at,stopped_at,duration_seconds
+Spotify,Example song,Example artist,Example album,2026-08-07T12:00:00-07:00,2026-08-07T12:03:12-07:00,192.000
+```
+
+This uses the `media-control` command to read the system media controller. Its
+MediaRemote adapter supports current macOS releases where direct access to the
+private framework is restricted. Install it with Homebrew before starting the
+tracker:
+
+```sh
+brew tap ungive/media-control
+brew install media-control
+```
+
+If the command is installed outside `PATH`, pass its location with
+`--media-command PATH`. The source value uses a service name when macOS provides
+one, otherwise it uses the reporting app's name or bundle identifier. Browser
+playback may therefore be labeled with the browser rather than the website.
+On non-macOS systems, the media CSV is initialized with its header but no
+sessions are collected.
+
 ## Development
 
-The implementation uses only the Python standard library. Run the test suite
-with:
+The tracker code uses only the Python standard library. macOS Now Playing
+collection additionally requires the external `media-control` command. Run the
+test suite with:
 
 ```sh
 python3 -m unittest discover -s tests -v
