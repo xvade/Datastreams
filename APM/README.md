@@ -105,6 +105,43 @@ playback may therefore be labeled with the browser rather than the website.
 On non-macOS systems, the media CSV is initialized with its header but no
 sessions are collected.
 
+## Brave website tracking
+
+The optional Manifest V3 extension records the hostname of Brave's active tab
+only while a Brave window is focused. It closes a session when the active site
+changes, Brave loses focus, or the active tab navigates to a non-web page. It
+does not store page paths, query strings, or titles. The native host appends
+completed sessions to `website_focus.csv`:
+
+```csv
+domain,started_at,stopped_at,duration_seconds
+www.youtube.com,2026-08-07T12:00:00-07:00,2026-08-07T12:03:12-07:00,192.000
+```
+
+Install it on macOS in two steps:
+
+1. Open `brave://extensions`, enable Developer mode, choose **Load unpacked**,
+   and select the repository's `brave_extension` directory.
+2. From the repository directory, register the local CSV writer in the
+   native-messaging folder Brave checks on macOS:
+
+   ```sh
+   python3 brave_extension/install_native_host.py
+   ```
+
+The installer registers a per-user native messaging host in
+`~/Library/Application Support/Google/Chrome/NativeMessagingHosts` (Brave's
+macOS native-host lookup location) and prints the output CSV path. If you
+previously ran an older version of the installer, rerun it after updating this
+project, then reload the extension or restart Brave. To choose another
+destination, pass `--output PATH` to the installer. The extension needs tab
+and navigation access to read the active hostname; the extension source is
+included here, and only hostnames are saved.
+Brave supports most Chromium extensions, and the extension uses Chromium's
+`tabs` and `webNavigation` events to follow active-tab changes and navigation.
+If you move this project after installation, rerun the installer so Brave's
+host registration points to the new path.
+
 ## Development
 
 The tracker code uses only the Python standard library. macOS Now Playing

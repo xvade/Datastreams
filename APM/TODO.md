@@ -8,6 +8,9 @@
   activation notifications if sub-second focus transition accuracy is needed.
 - Verify system media tracking with Spotify and browser playback on supported
   macOS versions; `media-control` must be installed for this check.
+- Verify the Brave extension's active-tab, navigation, and window-focus
+  transitions on macOS, including that the native host writes local-time CSV
+  sessions and reconnects after a browser restart.
 - Decide whether CSV rotation or retention limits are needed for long-running
   deployments.
 - Add an integration test that waits across a real minute boundary when the

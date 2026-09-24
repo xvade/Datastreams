@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "APM Website Tracker",
+  "version": "1.0.0",
+  "description": "Record time spent on the active Brave website to a local CSV.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAosXLYkL/GPXYblhjDVLpdesFEFN5Dum9+pbt+DLQE9SV4KJZ2UDtkGiaFZaGwcgejG1S9yft7lC4vZjeDr2Ui2U3XxF2IgT6r1vDqu5ZJrVKtM5jIJNrLxfcsMYKsVtogSqlrqzy614FYQ2MEWaDfFnrCoY7L/ysQ7lSpx+WbzSEU6HM2jPlyZQ6+2FdzK2VruRBrz3uRM8Ke9RSFCtXQSk/o98v9IDQpA1VMv2G2HPBUzlhzAO7puLTQUd8k8w4vsorkRTx18v9FZylsJmLe4+lHt+M5sMyTMuANvSJv/A+ERk0KewvFBKhb3cgycQu7kzvYnkWaaqgnW7QfWMEHQIDAQAB",
+  "permissions": [
+    "nativeMessaging",
+    "tabs",
+    "webNavigation"
+  ],
+  "background": {
+    "service_worker": "service_worker.js"
+  }
+}
